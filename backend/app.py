@@ -1,47 +1,33 @@
-import os
-import boto3
-import json
-from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+import boto3
+from datetime import datetime
+import os
 
 app = Flask(__name__)
 CORS(app)
 
 # AWS Configuration
-AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+AWS_CONFIG = {
+    'S3_BUCKET': 'face-attendance-images',
+    'REKOGNITION_COLLECTION': 'face-attendance',
+    'DYNAMODB_TABLE': 'AttendanceRecords',
+    'REGION': 'us-east-1'
+}
 
+# Add this at the top of your Flask app to verify AWS credentials
+sts = boto3.client('sts')
+try:
+    print(sts.get_caller_identity())
+except Exception as e:
+    print("AWS Credentials Error:", str(e))
+    
+    
 # Initialize AWS clients
-s3 = boto3.client('s3',
-                  aws_access_key_id=AWS_ACCESS_KEY_ID,
-                  aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                  region_name=AWS_REGION)
-
-rekognition = boto3.client('rekognition',
-                          aws_access_key_id=AWS_ACCESS_KEY_ID,
-                          aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                          region_name=AWS_REGION)
-
-dynamodb = boto3.resource('dynamodb',
-                         aws_access_key_id=AWS_ACCESS_KEY_ID,
-                         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                         region_name=AWS_REGION)
-
-# DynamoDB table
-attendance_table = dynamodb.Table('AttendanceRecords')
-
-# S3 bucket name
-S3_BUCKET = os.getenv('S3_BUCKET')
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg'}
+s3 = boto3.client('s3', region_name=AWS_CONFIG['REGION'])
+rekognition = boto3.client('rekognition', region_name=AWS_CONFIG['REGION'])
+dynamodb = boto3.resource('dynamodb', region_name=AWS_CONFIG['REGION'])
+attendance_table = dynamodb.Table(AWS_CONFIG['DYNAMODB_TABLE'])
 
 @app.route('/register', methods=['POST'])
 def register_face():
@@ -52,39 +38,26 @@ def register_face():
     user_id = request.form.get('user_id')
     
     if not user_id:
-        return jsonify({'error': 'User ID is required'}), 400
+        return jsonify({'error': 'User ID required'}), 400
     
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        s3_key = f'faces/{user_id}/{filename}'
+    try:
+        # Upload to S3
+        s3_key = f'faces/{user_id}/{file.filename}'
+        s3.upload_fileobj(file, AWS_CONFIG['S3_BUCKET'], s3_key)
         
-        try:
-            # Upload to S3
-            s3.upload_fileobj(file, S3_BUCKET, s3_key)
-            
-            # Index face in Rekognition
-            response = rekognition.index_faces(
-                CollectionId='attendance-faces',
-                Image={
-                    'S3Object': {
-                        'Bucket': S3_BUCKET,
-                        'Name': s3_key
-                    }
-                },
-                ExternalImageId=user_id,
-                DetectionAttributes=['ALL']
-            )
-            
-            return jsonify({
-                'message': 'Face registered successfully',
-                'face_id': response['FaceRecords'][0]['Face']['FaceId']
-            }), 200
-            
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+        # Index face in Rekognition
+        response = rekognition.index_faces(
+            CollectionId=AWS_CONFIG['REKOGNITION_COLLECTION'],
+            Image={'S3Object': {'Bucket': AWS_CONFIG['S3_BUCKET'], 'Name': s3_key}},
+            ExternalImageId=user_id
+        )
+        
+        return jsonify({
+            'message': 'Face registered successfully',
+            'face_id': response['FaceRecords'][0]['Face']['FaceId']
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/recognize', methods=['POST'])
 def recognize_face():
@@ -93,68 +66,51 @@ def recognize_face():
     
     file = request.files['file']
     
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and allowed_file(file.filename):
-        try:
-            # Upload to S3 temporarily
-            temp_key = f'temp/{datetime.now().timestamp()}.jpg'
-            s3.upload_fileobj(file, S3_BUCKET, temp_key)
-            
-            # Search for face in Rekognition
-            response = rekognition.search_faces_by_image(
-                CollectionId='attendance-faces',
-                Image={
-                    'S3Object': {
-                        'Bucket': S3_BUCKET,
-                        'Name': temp_key
-                    }
-                },
-                MaxFaces=1,
-                FaceMatchThreshold=70
-            )
-            
-            # Delete temporary file
-            s3.delete_object(Bucket=S3_BUCKET, Key=temp_key)
-            
-            if not response['FaceMatches']:
-                return jsonify({'error': 'No matching face found'}), 404
-            
-            user_id = response['FaceMatches'][0]['Face']['ExternalImageId']
-            confidence = response['FaceMatches'][0]['Similarity']
-            
-            # Record attendance
-            attendance_table.put_item(
-                Item={
-                    'user_id': user_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'status': 'present',
-                    'confidence': str(confidence)
-                }
-            )
-            
-            return jsonify({
-                'user_id': user_id,
-                'confidence': confidence,
-                'message': 'Attendance marked successfully'
-            }), 200
-            
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-@app.route('/attendance/<user_id>', methods=['GET'])
-def get_attendance(user_id):
     try:
-        response = attendance_table.query(
-            KeyConditionExpression='user_id = :uid',
-            ExpressionAttributeValues={
-                ':uid': user_id
+        # 1. Upload to S3 temporarily
+        temp_key = f'temp/{datetime.now().timestamp()}.jpg'
+        s3.upload_fileobj(file, AWS_CONFIG['S3_BUCKET'], temp_key)
+        
+        # 2. Search for face
+        response = rekognition.search_faces_by_image(
+            CollectionId=AWS_CONFIG['REKOGNITION_COLLECTION'],
+            Image={'S3Object': {
+                'Bucket': AWS_CONFIG['S3_BUCKET'],
+                'Name': temp_key
+            }},
+            FaceMatchThreshold=90,
+            MaxFaces=1
+        )
+        
+        # 3. Clean up temp file
+        s3.delete_object(Bucket=AWS_CONFIG['S3_BUCKET'], Key=temp_key)
+        
+        if not response.get('FaceMatches'):
+            return jsonify({'error': 'No matching face found'}), 404
+        
+        best_match = response['FaceMatches'][0]
+        user_id = best_match['Face']['ExternalImageId']
+        face_id = best_match['Face']['FaceId']  # Get the FaceId from Rekognition
+        
+        # 4. Record attendance - NOW INCLUDING THE FACE_ID
+        attendance_table.put_item(
+            Item={
+                'FaceId': face_id,  # Required partition key
+                'user_id': user_id,
+                'timestamp': datetime.now().isoformat(),
+                'confidence': str(best_match['Similarity']),
+                'status': 'present'
             }
         )
-        return jsonify(response['Items']), 200
+        
+        return jsonify({
+            'user_id': user_id,
+            'face_id': face_id,
+            'confidence': best_match['Similarity'],
+            'message': 'Attendance marked successfully'
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 if __name__ == '__main__':
-    app.run(debug=True) 
+    app.run(host='0.0.0.0', port=5000, debug=True)
