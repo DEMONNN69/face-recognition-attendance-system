@@ -5,6 +5,9 @@ import { useState, useRef, useEffect } from "react"
 import Webcam from "react-webcam"
 import axios from "axios"
 
+
+
+
 const API_URL = "http://127.0.0.1:5000"
 
 interface AttendanceRecord {
@@ -46,6 +49,8 @@ const App: React.FC = () => {
     }, 500)
   }, [])
 
+
+  
   const handleWebcamError = (error: string | DOMException) => {
     console.error("Webcam error:", error)
     setWebcamError(typeof error === "string" ? error : "Could not access camera. Please check permissions.")
@@ -124,7 +129,14 @@ const App: React.FC = () => {
       const data = await response.json();
       
       if (!response.ok) {
-        throw new Error(data.error || 'Recognition failed');
+        // Handle specific error cases
+        if (data.error === 'no_face_found') {
+          throw new Error('No face detected. Please ensure your face is clearly visible in the frame.');
+        } else if (data.error === 'no_match_found') {
+          throw new Error('Face not recognized. Please register first.');
+        } else {
+          throw new Error(data.message || 'Recognition failed');
+        }
       }
   
       setMessage(`Welcome ${data.user_id}! (${data.confidence}% match)`);
@@ -135,20 +147,23 @@ const App: React.FC = () => {
       
       if (error instanceof Error) {
         errorMessage = error.message;
-        
-        // Handle specific error codes from backend
-        if (error.message.includes('NO_MATCH')) {
-          errorMessage = "No matching face found. Please register first.";
-        }
       }
       
       setMessage(errorMessage);
+      
+      // Add to recent records as failed attempt
+      setRecentRecords(prev => [{
+        userId: "unknown",
+        timestamp: new Date().toLocaleString(),
+        status: "failed",
+        error: errorMessage // Optional: store the error details
+      }, ...prev.slice(0, 4)]);
+      
       throw error;
     } finally {
       setLoading(false);
     }
   };
-
   const getAttendance = async (userId: string) => {
     try {
       const response = await fetch(`${API_URL}/attendance/${userId}`);
@@ -663,7 +678,7 @@ const App: React.FC = () => {
                 className={`h-6 w-6 text-gray-500 transition-transform duration-300 transform ${showInstructions ? "rotate-180" : ""}`}
               >
                 <ChevronDownIcon />
-              </span>
+              </span> 
             </div>
 
             <div

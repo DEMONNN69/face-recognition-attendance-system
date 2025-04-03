@@ -62,31 +62,37 @@ def register_face():
 @app.route('/recognize', methods=['POST'])
 def recognize_face():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+        return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
     
     try:
-        # 1. Upload to S3 temporarily
+        # Upload to S3 temporarily
         temp_key = f'temp/{datetime.now().timestamp()}.jpg'
         s3.upload_fileobj(file, AWS_CONFIG['S3_BUCKET'], temp_key)
         
-        # 2. Search for face
-        response = rekognition.search_faces_by_image(
-            CollectionId=AWS_CONFIG['REKOGNITION_COLLECTION'],
-            Image={'S3Object': {
-                'Bucket': AWS_CONFIG['S3_BUCKET'],
-                'Name': temp_key
-            }},
-            FaceMatchThreshold=90,
-            MaxFaces=1
-        )
-        
-        # 3. Clean up temp file
+        try:
+            # Search for face in Rekognition
+            response = rekognition.search_faces_by_image(
+                CollectionId=AWS_CONFIG['REKOGNITION_COLLECTION'],
+                Image={'S3Object': {'Bucket': AWS_CONFIG['S3_BUCKET'], 'Name': temp_key}},
+                FaceMatchThreshold=85,
+                MaxFaces=1
+            )
+        except rekognition.exceptions.InvalidParameterException as e:
+            return jsonify({
+                'error': 'no_face_found',
+                'message': 'No face detected in the image. Please ensure your face is clearly visible.'
+            }), 400
+            
+        # Clean up temp file
         s3.delete_object(Bucket=AWS_CONFIG['S3_BUCKET'], Key=temp_key)
         
         if not response.get('FaceMatches'):
-            return jsonify({'error': 'No matching face found'}), 404
+            return jsonify({
+                'error': 'no_match_found',
+                'message': 'No matching face found in our system. Please register first.'
+            }), 404
         
         best_match = response['FaceMatches'][0]
         user_id = best_match['Face']['ExternalImageId']
